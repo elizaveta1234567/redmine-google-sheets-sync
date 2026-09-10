@@ -1,0 +1,17 @@
+# Секретный ключ Google — НИКОГДА не грузим
+service_account.json
+**/service_account.json
+
+# Кэш Python
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Логи синхронизации
+sync.log
+*.log
+
+# Локальные секреты, если добавим позже
+.env
+.env.*
+!.env.example
