@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
+import queue
 import re
 import sys
+import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -26,12 +29,13 @@ from redmine_client import (
 # =============================================================================
 # ВЕРСИЯ И КОНСТАНТЫ
 # =============================================================================
-SCRIPT_VERSION = "1.3-unified-continuous"
+SCRIPT_VERSION = "1.4-saved-key-countdown"
 
 INCLUDE_CLOSED = True
 ISSUES_SORT = "id:desc"
 TRACKER_FILTER = "Ошибка"
 SYNC_INTERVAL_MINUTES = 5
+DEFAULT_REDMINE_URL = "https://redmine.justmoby.com/"
 
 # JSON-ключ service account. Положи файл рядом со скриптом.
 SERVICE_ACCOUNT_FILE = Path(__file__).resolve().parent / "service_account.json"
@@ -107,6 +111,18 @@ def save_config(config: dict[str, Any]) -> None:
         json.dump(config, f, indent=2, ensure_ascii=False)
 
 
+def get_redmine_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Получить сохранённые параметры подключения к Redmine."""
+    redmine_config = config.get("redmine")
+    return redmine_config if isinstance(redmine_config, dict) else {}
+
+
+def save_redmine_config(config: dict[str, Any], url: str, api_key: str) -> None:
+    """Сохранить URL и API ключ Redmine."""
+    config["redmine"] = {"url": url, "api_key": api_key}
+    save_config(config)
+
+
 def get_project_config(config: dict[str, Any], project_name: str) -> dict[str, Any] | None:
     """Получить конфиг для проекта."""
     project_config = config.get("projects", {}).get(project_name)
@@ -179,6 +195,72 @@ def trim_comment(text: str) -> str:
     if MAX_COMMENT_LENGTH is None or len(text) <= MAX_COMMENT_LENGTH:
         return text
     return text[: MAX_COMMENT_LENGTH - 1].rstrip() + "…"
+
+
+class BackgroundConsoleWriter:
+    """Пишет в консоль из отдельного потока.
+
+    Консоль Windows приостанавливает вывод, пока в окне выделен текст. Без этой
+    обёртки на таком выводе замирает и сама синхронизация.
+    """
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+        self._queue: queue.Queue[Optional[str]] = queue.Queue()
+        self._thread = threading.Thread(target=self._drain, daemon=True)
+        self._thread.start()
+
+    def write(self, text: str) -> int:
+        self._queue.put(text)
+        return len(text)
+
+    def flush(self) -> None:
+        return None
+
+    def isatty(self) -> bool:
+        try:
+            return bool(self._stream.isatty())
+        except Exception:
+            return False
+
+    def close_and_flush(self, timeout: float = 5.0) -> None:
+        self._queue.put(None)
+        self._thread.join(timeout)
+
+    def _drain(self) -> None:
+        while True:
+            text = self._queue.get()
+            if text is None:
+                break
+            try:
+                self._stream.write(text)
+                self._stream.flush()
+            except Exception:
+                pass
+
+
+def enable_background_console_output() -> list[BackgroundConsoleWriter]:
+    """Перевести вывод в фоновый поток, чтобы пауза консоли не блокировала работу."""
+    writers = [BackgroundConsoleWriter(sys.stdout), BackgroundConsoleWriter(sys.stderr)]
+    sys.stdout, sys.stderr = writers
+    return writers
+
+
+def wait_until_next_sync(interval_minutes: int, reason: str = "Следующее обновление") -> None:
+    """Ждать до следующего запуска, показывая обратный отсчёт."""
+    next_run = datetime.now() + timedelta(minutes=interval_minutes)
+    print(f"\n⏭ {reason} в {next_run.strftime('%H:%M:%S')}")
+    print("Нажми Ctrl+C для остановки")
+
+    while True:
+        remaining = (next_run - datetime.now()).total_seconds()
+        if remaining <= 0:
+            break
+        minutes, seconds = divmod(int(remaining), 60)
+        print(f"⏳ Осталось {minutes:02d}:{seconds:02d}", end="\r", flush=True)
+        time.sleep(min(1.0, remaining))
+
+    print(" " * 40, end="\r")
 
 
 # =============================================================================
@@ -758,21 +840,16 @@ def run_sync_periodically(
                     worksheet_gid=worksheet_gid,
                 )
 
-                print(f"✓ Синхронизация завершена в {datetime.now().strftime('%H:%M:%S')}")
-                print(f"\n💤 Следующее обновление в {datetime.now().strftime('%H:%M:%S')} + {interval_minutes} мин")
-                print("Нажми Ctrl+C для остановки\n")
-
-                time.sleep(interval_minutes * 60)
+                print(f"✓ Синхронизация #{sync_count} завершена в {datetime.now().strftime('%H:%M:%S')}")
+                wait_until_next_sync(interval_minutes)
 
             except (RedmineAPIError, RuntimeError, ValueError, KeyError, gspread.GSpreadException) as exc:
                 print(f"\n✗ ОШИБКА при синхронизации #{sync_count}: {exc}", file=sys.stderr)
-                print(f"⚠ Повторная попытка через {interval_minutes} минут...\n")
-                time.sleep(interval_minutes * 60)
+                wait_until_next_sync(interval_minutes, "Повторная попытка")
 
             except Exception as exc:
                 print(f"\n✗ Неожиданная ошибка: {exc}", file=sys.stderr)
-                print(f"⚠ Повторная попытка через {interval_minutes} минут...\n")
-                time.sleep(interval_minutes * 60)
+                wait_until_next_sync(interval_minutes, "Повторная попытка")
 
     except KeyboardInterrupt:
         print(f"\n\n⚠ Синхронизация остановлена пользователем")
@@ -789,28 +866,62 @@ def main() -> int:
         config = load_config()
 
         # 1. Redmine URL
-        redmine_url = prompt("Введите URL Redmine", "https://redmine.justmoby.com/")
-        
-        # 2. Redmine API Key
-        redmine_api_key = prompt("Введите Redmine API ключ")
+        redmine_config = get_redmine_config(config)
+        redmine_url = prompt("Введите URL Redmine", redmine_config.get("url") or DEFAULT_REDMINE_URL)
+
+        # 2. Redmine API Key: переменная окружения -> сохранённый -> ручной ввод
+        env_api_key = os.getenv("REDMINE_API_KEY", "").strip()
+        saved_api_key = str(redmine_config.get("api_key") or "").strip()
+
+        if env_api_key:
+            redmine_api_key = env_api_key
+            key_is_new = False
+            print("✓ Использую Redmine API ключ из переменной REDMINE_API_KEY")
+        elif saved_api_key:
+            redmine_api_key = saved_api_key
+            key_is_new = False
+            print("✓ Использую сохранённый Redmine API ключ")
+        else:
+            redmine_api_key = prompt("Введите Redmine API ключ")
+            key_is_new = True
+
         if not redmine_api_key:
             raise ValueError("API ключ не может быть пустым")
 
-        # Подключаемся к Redmine
-        print("\n⏳ Подключаюсь к Redmine...")
-        redmine = RedmineClient(
-            base_url=redmine_url,
-            api_key=redmine_api_key,
-            verify_ssl=VERIFY_SSL,
-        )
+        # Подключаемся к Redmine. Если сохранённый ключ отозван, просим ввести новый.
+        while True:
+            print("\n⏳ Подключаюсь к Redmine...")
+            try:
+                redmine = RedmineClient(
+                    base_url=redmine_url,
+                    api_key=redmine_api_key,
+                    verify_ssl=VERIFY_SSL,
+                )
+                me = redmine.get_current_user()
+                break
+            except RedmineAPIError as exc:
+                if key_is_new:
+                    raise
+                print(f"✗ Сохранённый ключ не подошёл: {exc}", file=sys.stderr)
+                redmine_api_key = prompt("Введите Redmine API ключ заново")
+                if not redmine_api_key:
+                    raise ValueError("API ключ не может быть пустым")
+                key_is_new = True
 
-        me = redmine.get_current_user()
         user_name = (
             me.get("login")
             or f"{me.get('firstname', '')} {me.get('lastname', '')}".strip()
             or str(me.get("id", "?"))
         )
         print(f"✓ Подключение успешно: {user_name}")
+
+        if key_is_new:
+            save_choice = prompt("Сохранить ключ, чтобы не вводить его каждый раз? (y/n)", "y").lower().strip()
+            if save_choice in ("y", "yes", "да", "д", ""):
+                save_redmine_config(config, redmine_url, redmine_api_key)
+                print(f"✓ Ключ сохранён в {CONFIG_FILE.name} (файл не попадает в git)")
+        elif not env_api_key and redmine_config.get("url") != redmine_url:
+            save_redmine_config(config, redmine_url, redmine_api_key)
 
         # 3. Выбираем проект
         print("\n⏳ Загружаю список проектов...")
@@ -894,6 +1005,11 @@ def main() -> int:
         print(f"✓ Автосинхронизация каждые {SYNC_INTERVAL_MINUTES} минут")
         print("Первая синхронизация запускается сейчас.")
         print("Для остановки нажми Ctrl+C.")
+
+        # Вывод уходит в фоновый поток: выделение текста в консоли больше не
+        # останавливает синхронизацию. Включаем после интерактивных вопросов.
+        enable_background_console_output()
+
         return run_sync_periodically(
             redmine,
             project,
@@ -915,4 +1031,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit_code = main()
+    for stream in (sys.stdout, sys.stderr):
+        if isinstance(stream, BackgroundConsoleWriter):
+            stream.close_and_flush()
+    raise SystemExit(exit_code)
