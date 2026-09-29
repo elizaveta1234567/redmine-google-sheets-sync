@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Mapping, Optional
 import os
+import threading
+import time
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -30,6 +32,22 @@ REDMINE_PASSWORD = ""
 VERIFY_SSL = True
 
 DEFAULT_TIMEOUT_SECONDS = 30
+
+# Общий лимит на все клиенты и потоки: не чаще одного запроса в этот интервал.
+MIN_REQUEST_INTERVAL_SECONDS = 0.25
+_REQUEST_LOCK = threading.Lock()
+_LAST_REQUEST_AT = 0.0
+
+
+def _wait_for_request_slot() -> None:
+    """Не давать параллельным профилям бить Redmine одновременно."""
+    global _LAST_REQUEST_AT
+    with _REQUEST_LOCK:
+        now = time.monotonic()
+        wait_for = MIN_REQUEST_INTERVAL_SECONDS - (now - _LAST_REQUEST_AT)
+        if wait_for > 0:
+            time.sleep(wait_for)
+        _LAST_REQUEST_AT = time.monotonic()
 
 
 class RedmineAPIError(RuntimeError):
@@ -108,6 +126,7 @@ class RedmineClient:
         params: Optional[Mapping[str, Any]] = None,
         json: Optional[Mapping[str, Any]] = None,
     ) -> Any:
+        _wait_for_request_slot()
         try:
             response = self.session.request(
                 method=method,

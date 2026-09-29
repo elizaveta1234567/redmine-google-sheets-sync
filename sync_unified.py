@@ -547,6 +547,19 @@ def build_rows(redmine: RedmineClient, issues: list[dict[str, Any]]) -> list[lis
 
     for index, issue_stub in enumerate(issues, start=1):
         issue_id = int(issue_stub["id"])
+        stub_tracker = normalize_text(issue_stub.get("tracker"))
+        if (
+            TRACKER_FILTER
+            and stub_tracker
+            and stub_tracker.casefold().strip() != TRACKER_FILTER.casefold().strip()
+        ):
+            skipped_count += 1
+            if len(tracker_mismatch) < 5:
+                tracker_mismatch.append(
+                    f"#{issue_id} (трекер: '{stub_tracker}', статус: {normalize_text(issue_stub.get('status'))})"
+                )
+            continue
+
         print(f"[{index}/{total}] Обновляю задачу #{issue_id}...", end="\r")
 
         try:
@@ -560,7 +573,7 @@ def build_rows(redmine: RedmineClient, issues: list[dict[str, Any]]) -> list[lis
         
         if tracker.casefold().strip() != TRACKER_FILTER.casefold().strip():
             skipped_count += 1
-            if len(tracker_mismatch) < 5:  # Показываем первые 5 пропущенные
+            if len(tracker_mismatch) < 5:
                 tracker_mismatch.append(f"#{issue_id} (трекер: '{tracker_name}', статус: {normalize_text(issue.get('status'))})")
             continue
 
