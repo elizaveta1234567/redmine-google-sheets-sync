@@ -9,7 +9,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -447,9 +447,14 @@ def fetch_issues(
     redmine: RedmineClient,
     project_id: int,
     version_ids: list[int] | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> list[dict[str, Any]]:
     """Получить задачи проекта (опционально отфильтрованные по версиям)."""
     issues_by_id: dict[int, dict[str, Any]] = {}
+
+    def report(message: str) -> None:
+        if on_progress:
+            on_progress(message)
     
     print(f"\n🔍 DEBUG: Параметры запроса к Redmine:")
     print(f"   project_id={project_id}")
@@ -457,14 +462,19 @@ def fetch_issues(
     print(f"   sort={ISSUES_SORT}")
     if version_ids:
         print(f"   version_ids={version_ids}")
+        report(f"Загружаю {len(version_ids)} версий")
+    else:
+        report("Версии не выбраны: загружаю весь проект")
     
     if version_ids:
-        for version_id in version_ids:
+        for index, version_id in enumerate(version_ids, start=1):
+            report(f"Версия {index}/{len(version_ids)}")
             version_issues = redmine.get_issues(
                 project_id=project_id,
                 include_closed=INCLUDE_CLOSED,
                 sort=ISSUES_SORT,
                 fixed_version_id=version_id,
+                include="journals",
             )
             for issue in version_issues:
                 issues_by_id[int(issue["id"])] = issue
@@ -478,8 +488,10 @@ def fetch_issues(
             project_id=project_id,
             include_closed=INCLUDE_CLOSED,
             sort=ISSUES_SORT,
+            include="journals",
         )
     
+    report(f"Получено задач: {len(issues)}")
     print(f"\n📊 DEBUG: Получено всего задач с сервера: {len(issues)}")
     if issues:
         first_issue = issues[0]
@@ -538,7 +550,12 @@ def connect_google_sheet(sheet_id: str, worksheet_gid: Optional[int] = None):
     return spreadsheet, worksheet, worksheets
 
 
-def build_rows(redmine: RedmineClient, issues: list[dict[str, Any]]) -> list[list[str]]:
+def build_rows(
+    redmine: RedmineClient,
+    issues: list[dict[str, Any]],
+    on_progress: Callable[[str], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> list[list[str]]:
     """Построить строки для Google Sheets."""
     rows: list[list[str]] = []
     total = len(issues)
@@ -546,6 +563,8 @@ def build_rows(redmine: RedmineClient, issues: list[dict[str, Any]]) -> list[lis
     tracker_mismatch = []
 
     for index, issue_stub in enumerate(issues, start=1):
+        if should_stop and should_stop():
+            raise KeyboardInterrupt
         issue_id = int(issue_stub["id"])
         stub_tracker = normalize_text(issue_stub.get("tracker"))
         if (
@@ -561,12 +580,17 @@ def build_rows(redmine: RedmineClient, issues: list[dict[str, Any]]) -> list[lis
             continue
 
         print(f"[{index}/{total}] Обновляю задачу #{issue_id}...", end="\r")
+        if on_progress and (index == 1 or index % 25 == 0 or index == total):
+            on_progress(f"Готовлю таблицу: {index}/{total}")
 
-        try:
-            issue = redmine.get_issue(issue_id, include="journals")
-        except RedmineAPIError as exc:
-            print(f"\nПредупреждение: не удалось обновить задачу #{issue_id}: {exc}")
-            issue = issue_stub
+        issue = issue_stub
+        comment_already_known = bool(get_custom_field(issue_stub, COMMENT_CUSTOM_FIELD))
+        if "journals" not in issue_stub and not comment_already_known and FETCH_LAST_COMMENT_IF_FIELD_EMPTY:
+            try:
+                issue = redmine.get_issue(issue_id, include="journals")
+            except RedmineAPIError as exc:
+                print(f"\nПредупреждение: не удалось обновить задачу #{issue_id}: {exc}")
+                issue = issue_stub
 
         tracker = normalize_text(issue.get("tracker"))
         tracker_name = issue.get("tracker", {}).get("name", "Unknown") if isinstance(issue.get("tracker"), dict) else tracker
@@ -767,10 +791,16 @@ def sync_to_google_sheets(
     selected_versions: list[dict[str, Any]],
     sheet_id: str,
     worksheet_gid: Optional[int] = None,
+    on_progress: Callable[[str], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> None:
     """Синхронизировать задачи в Google Sheets."""
+    if on_progress:
+        on_progress("Подключаюсь к Google Sheets")
     spreadsheet, worksheet, worksheets = connect_google_sheet(sheet_id, worksheet_gid)
-    rows = build_rows(redmine, issues)
+    rows = build_rows(redmine, issues, on_progress=on_progress, should_stop=should_stop)
+    if on_progress:
+        on_progress(f"Записываю {len(rows)} строк")
 
     worksheet.batch_clear(["A:G"])
     values = [HEADERS] + rows

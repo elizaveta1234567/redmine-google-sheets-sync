@@ -48,6 +48,7 @@ class SyncDesktopApp:
         self.ui_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.workers: dict[str, tuple[threading.Thread, threading.Event]] = {}
         self.profile_status: dict[str, str] = {}
+        self._start_queue: list[dict[str, Any]] = []
 
         self.url_var = tk.StringVar()
         self.api_key_var = tk.StringVar()
@@ -244,7 +245,7 @@ class SyncDesktopApp:
         self.project_combo.grid(row=1, column=1, sticky="ew", pady=4)
         self.project_combo.bind("<<ComboboxSelected>>", self._on_project_selected)
 
-        ttk.Label(editor_frame, text="Версии").grid(row=2, column=0, sticky="nw", pady=4)
+        ttk.Label(editor_frame, text="Версии (обязательно)").grid(row=2, column=0, sticky="nw", pady=4)
         versions_holder = ttk.Frame(editor_frame)
         versions_holder.grid(row=2, column=1, sticky="nsew", pady=4)
         versions_holder.columnconfigure(0, weight=1)
@@ -412,6 +413,9 @@ class SyncDesktopApp:
             for i in selected_indices
             if i < len(self.versions)
         ]
+        if not selected_versions:
+            messagebox.showwarning(APP_TITLE, "Выберите хотя бы одну версию.")
+            return
         profile_id = self.selected_profile_id or uuid.uuid4().hex
         existing = self._profile_by_id(profile_id)
         worksheet = self.worksheets_by_label.get(self.worksheet_var.get())
@@ -502,18 +506,108 @@ class SyncDesktopApp:
     # ------------------------------------------------------------------
     def start_selected(self) -> None:
         profile_id = self._selected_tree_id()
-        if not profile_id:
+        profile = self._profile_by_id(profile_id) if profile_id else None
+        if not profile:
             messagebox.showinfo(APP_TITLE, "Выберите профиль в списке.")
             return
-        self._start_profile(profile_id)
+        self._queue_starts([profile])
 
     def start_all(self) -> None:
         profiles = [p for p in self._profiles() if p.get("enabled", True)]
         if not profiles:
             messagebox.showinfo(APP_TITLE, "Нет включённых профилей.")
             return
-        for index, profile in enumerate(profiles):
-            self._start_profile(str(profile["id"]), start_delay_seconds=index * 8)
+        self._queue_starts(profiles)
+
+    def _queue_starts(self, profiles: list[dict[str, Any]]) -> None:
+        if not self.redmine:
+            messagebox.showwarning(APP_TITLE, "Сначала подключитесь к Redmine.")
+            return
+        queued = [
+            profile
+            for profile in profiles
+            if str(profile.get("id")) not in self.workers
+            and str(profile.get("id")) not in {str(item.get("id")) for item in self._start_queue}
+        ]
+        if not queued:
+            return
+        self._start_queue.extend(queued)
+        if len(self._start_queue) == len(queued):
+            self._ask_next_profile_versions()
+
+    def _ask_next_profile_versions(self) -> None:
+        if not self._start_queue or not self.redmine:
+            return
+        profile = self._start_queue[0]
+        self._set_status(str(profile["id"]), "Выбор версии…")
+        threading.Thread(
+            target=self._load_versions_for_start,
+            args=(self.redmine, int(profile["project_id"]), str(profile["id"])),
+            daemon=True,
+        ).start()
+
+    def _load_versions_for_start(
+        self, client: RedmineClient, project_id: int, profile_id: str
+    ) -> None:
+        try:
+            versions = client.get_project_versions(project_id)
+            self.ui_queue.put(("choose_versions", (profile_id, versions)))
+        except Exception as exc:
+            self.ui_queue.put(("choose_versions_error", (profile_id, exc)))
+
+    def _choose_versions(
+        self, profile: dict[str, Any], versions: list[dict[str, Any]]
+    ) -> list[dict[str, Any]] | None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Версии — {profile.get('project_name', profile.get('name', ''))}")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.geometry("520x420")
+        dialog.minsize(420, 320)
+
+        ttk.Label(
+            dialog,
+            text="Выберите одну или несколько версий. Без версии синхронизация не запустится.",
+            wraplength=480,
+        ).pack(anchor="w", padx=12, pady=(12, 6))
+
+        holder = ttk.Frame(dialog)
+        holder.pack(fill="both", expand=True, padx=12, pady=6)
+        version_list = tk.Listbox(holder, selectmode="extended", exportselection=False)
+        version_list.pack(side="left", fill="both", expand=True)
+        scroll = ttk.Scrollbar(holder, orient="vertical", command=version_list.yview)
+        scroll.pack(side="right", fill="y")
+        version_list.configure(yscrollcommand=scroll.set)
+
+        saved_ids = {int(item["id"]) for item in profile.get("versions", []) if "id" in item}
+        for index, version in enumerate(versions):
+            version_list.insert("end", f"[{version.get('id')}] {version.get('name', '')}")
+            if int(version.get("id", 0)) in saved_ids:
+                version_list.selection_set(index)
+
+        chosen: list[dict[str, Any]] | None = None
+
+        def confirm() -> None:
+            nonlocal chosen
+            selected = [
+                {"id": int(versions[index]["id"]), "name": str(versions[index].get("name", ""))}
+                for index in version_list.curselection()
+                if index < len(versions)
+            ]
+            if not selected:
+                messagebox.showwarning(APP_TITLE, "Выберите хотя бы одну версию.", parent=dialog)
+                return
+            chosen = selected
+            dialog.destroy()
+
+        buttons = ttk.Frame(dialog)
+        buttons.pack(fill="x", padx=12, pady=(0, 12))
+        ttk.Button(buttons, text="Запустить", command=confirm).pack(side="right")
+        ttk.Button(buttons, text="Пропустить", command=dialog.destroy).pack(side="right", padx=(0, 6))
+        dialog.bind("<Return>", lambda _event: confirm())
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        dialog.wait_window()
+        return chosen
 
     def _start_profile(self, profile_id: str, start_delay_seconds: int = 0) -> None:
         if profile_id in self.workers:
@@ -563,13 +657,27 @@ class SyncDesktopApp:
                 "name": str(profile["project_name"]),
             }
             versions = list(profile.get("versions", []))
-            version_ids = [int(v["id"]) for v in versions] or None
+            if not versions:
+                self.ui_queue.put(
+                    ("sync_error", (profile_id, profile["name"], "Не выбрана ни одна версия"))
+                )
+                return
+            version_ids = [int(version["id"]) for version in versions]
             interval = max(1, int(profile.get("interval_minutes", DEFAULT_INTERVAL_MINUTES)))
 
             while not stop_event.is_set():
                 self.ui_queue.put(("sync_started", (profile_id, profile["name"])))
+
+                def report(message: str, profile_id: str = profile_id, name: str = str(profile["name"])) -> None:
+                    self.ui_queue.put(("sync_progress", (profile_id, name, message)))
+
                 try:
-                    issues = fetch_issues(redmine, int(project["id"]), version_ids)
+                    issues = fetch_issues(
+                        redmine,
+                        int(project["id"]),
+                        version_ids,
+                        on_progress=report,
+                    )
                     sync_to_google_sheets(
                         redmine,
                         project,
@@ -577,11 +685,15 @@ class SyncDesktopApp:
                         versions,
                         str(profile["sheet_id"]),
                         worksheet_gid=profile.get("worksheet_gid"),
+                        on_progress=report,
+                        should_stop=stop_event.is_set,
                     )
                     next_run = datetime.now().timestamp() + interval * 60
                     self.ui_queue.put(
                         ("sync_ok", (profile_id, profile["name"], len(issues), next_run))
                     )
+                except KeyboardInterrupt:
+                    break
                 except Exception as exc:
                     self.ui_queue.put(("sync_error", (profile_id, profile["name"], exc)))
                 if stop_event.wait(interval * 60):
@@ -677,10 +789,48 @@ class SyncDesktopApp:
             self.load_tabs_button.configure(state="normal")
             self.worksheet_var.set("")
             messagebox.showerror(APP_TITLE, str(payload))
+        elif event == "choose_versions":
+            profile_id, versions = payload
+            if not self._start_queue or str(self._start_queue[0].get("id")) != profile_id:
+                return
+            profile = self._start_queue.pop(0)
+            if not versions:
+                self._set_status(profile_id, "Нет версий")
+                self._log(f"{profile.get('name')}: в Redmine нет версий, запуск отменён.")
+            else:
+                chosen = self._choose_versions(profile, versions)
+                if chosen:
+                    stored = self._profile_by_id(profile_id)
+                    if stored is not None:
+                        stored["versions"] = chosen
+                        profile = stored
+                    self._save_config()
+                    self._refresh_profiles()
+                    self._log(
+                        f"{profile.get('name')}: версии — "
+                        + ", ".join(str(version.get("name", "")) for version in chosen)
+                    )
+                    self._start_profile(profile_id)
+                else:
+                    self._set_status(profile_id, "Пропущен")
+                    self._log(f"{profile.get('name')}: запуск пропущен, версии не выбраны.")
+            self._ask_next_profile_versions()
+        elif event == "choose_versions_error":
+            profile_id, exc = payload
+            if self._start_queue and str(self._start_queue[0].get("id")) == profile_id:
+                profile = self._start_queue.pop(0)
+                self._set_status(profile_id, "Ошибка")
+                self._log(f"{profile.get('name')}: не удалось загрузить версии — {exc}")
+            self._ask_next_profile_versions()
         elif event == "sync_started":
             profile_id, name = payload
             self._set_status(profile_id, "Синхронизация…")
             self._log(f"{name}: синхронизация началась.")
+        elif event == "sync_progress":
+            profile_id, name, message = payload
+            self._set_status(profile_id, message)
+            if not message.startswith("Готовлю таблицу"):
+                self._log(f"{name}: {message}.")
         elif event == "sync_ok":
             profile_id, name, issue_count, next_timestamp = payload
             next_time = datetime.fromtimestamp(next_timestamp).strftime("%H:%M:%S")
@@ -702,7 +852,7 @@ class SyncDesktopApp:
         for profile in self._profiles():
             profile_id = str(profile.get("id", ""))
             versions = profile.get("versions", [])
-            version_text = ", ".join(str(v.get("name", "")) for v in versions) or "Все"
+            version_text = ", ".join(str(v.get("name", "")) for v in versions) or "Не выбраны"
             status = self.profile_status.get(profile_id, "Остановлен")
             self.profile_tree.insert(
                 "",
